@@ -17,14 +17,26 @@ eframe = { version = "0.31", default-features = false, features = [
 egui = "*"
 rfd = "0.15"
 
+smol = "2.0"
+futures-util = { version = "*", features = [
+    "io",
+] } # needed to get rfd to compile
+
 # future plans :eyes:
 #rusty_ffmpeg = { version = "0.16", features = ["ffmpeg7"] }
 
 rubato = "0.16"
-symphonia = { version = "0.5", features = ["opt-simd", "all"] }
+symphonia = { git = "https://github.com/GamingLiamStudios/Symphonia.git", branch = "dev-0.6", features = [
+    "opt-simd",
+    "all",
+] }
 cpal = "0.15"
 
-futures-util = { version = "*", features = ["io"] }
+zbus = "5.5"
+atomig = { version = "0.4", features = ["derive"] }
+
+[patch.crates-io]
+cpal = { git = "https://github.com/GamingLiamStudios/cpal.git" }
 
 [lints.clippy]
 enum_glob_use = "deny"

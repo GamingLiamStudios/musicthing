@@ -1,8 +1,16 @@
 use std::{
     collections::VecDeque,
+    sync::{
+        Arc,
+        mpsc::SyncSender,
+    },
     time::Duration,
 };
 
+use atomig::{
+    Atom,
+    Atomic,
+};
 use cpal::traits::{
     DeviceTrait,
     HostTrait,
@@ -10,33 +18,57 @@ use cpal::traits::{
 };
 use eframe::NativeOptions;
 use symphonia::core::{
-    audio::{
-        AudioBuffer,
-        AudioBufferRef,
-        Signal,
+    audio::AudioBuffer,
+    codecs::audio::{
+        AudioCodecParameters,
+        AudioDecoder,
+        AudioDecoderOptions,
     },
-    codecs::{
-        Decoder,
-        DecoderOptions,
+    formats::{
+        FormatOptions,
+        FormatReader,
+        probe::Hint,
     },
-    formats::FormatOptions,
     io::{
         MediaSourceStream,
         MediaSourceStreamOptions,
     },
     meta::MetadataOptions,
-    probe::{
-        Hint,
-        ProbeResult,
+    units::{
+        Time,
+        TimeBase,
+        TimeStamp,
     },
 };
-use tracing::info;
+use tracing::{
+    debug,
+    info,
+    trace,
+};
+use tracing_subscriber::{
+    Layer,
+    filter::Targets,
+    fmt,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let fmt_subscriber = tracing_subscriber::fmt::Subscriber::builder()
-        .with_max_level(tracing::Level::DEBUG)
-        .finish();
-    tracing::subscriber::set_global_default(fmt_subscriber)?;
+    let stdout_log = fmt::layer();
+
+    tracing_subscriber::registry()
+        .with(
+            stdout_log.with_filter(
+                Targets::default()
+                    .with_target("symphonia", tracing::Level::TRACE)
+                    .with_target("musicthing", tracing::Level::TRACE)
+                    .with_target("wgpu", tracing::Level::WARN)
+                    .with_target("egui", tracing::Level::WARN)
+                    .with_target("eframe", tracing::Level::WARN)
+                    .with_default(tracing::Level::INFO),
+            ),
+        )
+        .init();
 
     eframe::run_native(
         "musicthing",
@@ -52,12 +84,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct App {
-    audio_device: cpal::Device,
+/// # Panics
+/// FIXME: Error Handling
+pub fn empty_stream(device: &cpal::Device) -> cpal::Stream {
+    let config = device
+        .supported_output_configs()
+        .expect("No output configs")
+        .next()
+        .expect("No output configs")
+        .with_max_sample_rate()
+        .config();
 
-    current_stream: Option<cpal::Stream>,
+    let stream = device
+        .build_output_stream(
+            &config,
+            |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                data.fill(0.0);
+            },
+            |err| {
+                tracing::error!(?err);
+            },
+            None,
+        )
+        .expect("Failed to build output stream");
+    let _ = stream.pause();
+
+    stream
 }
 
+struct Metadata {
+    duration: TimeStamp,
+    timebase: TimeBase,
+}
+
+struct App {
+    device: cpal::Device,
+    stream: cpal::Stream,
+
+    position: Arc<Atomic<TimeStamp>>,
+    metadata: Option<Metadata>,
+}
+
+// TODO: Fix reliance on HW Stream Pausing
 impl App {
     pub fn new(_context: &eframe::CreationContext) -> Self {
         let host = cpal::default_host();
@@ -66,9 +134,140 @@ impl App {
             .expect("No default output device");
 
         Self {
-            audio_device:   device,
-            current_stream: None,
+            stream: empty_stream(&device),
+            position: Arc::new(Atomic::new(TimeStamp::default())),
+            metadata: None,
+            device,
         }
+    }
+
+    pub fn request_seek(
+        &self,
+        pos: Time,
+    ) {
+        let Some(ref metadata) = self.metadata else {
+            return;
+        };
+
+        let ts = metadata.timebase.calc_timestamp(pos);
+        let _ = self.stream.pause();
+        self.position
+            .store(ts, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_symphonia_stream(
+        &mut self,
+        mut format: Box<dyn FormatReader>,
+    ) {
+        // FIXME: Error handling
+        let track = format
+            .default_track(symphonia::core::formats::TrackType::Audio)
+            .expect("no default track");
+        let track_id = track.id;
+
+        let duration = track.num_frames.expect("No length to track");
+        let timebase = track.time_base.expect("Track missing Timebase");
+        self.metadata = Some(Metadata { duration, timebase });
+
+        self.position
+            .store(track.start_ts, std::sync::atomic::Ordering::SeqCst);
+
+        let mut decoder: Box<dyn AudioDecoder> = symphonia::default::get_codecs()
+            .make_audio_decoder(
+                track
+                    .codec_params
+                    .as_ref()
+                    .expect("No codec params")
+                    .audio()
+                    .expect("Track not Audio"),
+                &AudioDecoderOptions::default(),
+            )
+            .expect("Track codec unsupported");
+        let codec = decoder.codec_params();
+
+        let available_device = self
+            .device
+            .supported_output_configs()
+            .expect("No output configs")
+            .find(|config| {
+                config.channels() as usize
+                    == codec
+                        .channels
+                        .clone()
+                        .map(|c| c.count())
+                        .expect("No channels in Audio file")
+                    && config.sample_format() == cpal::SampleFormat::F32
+            })
+            .expect("No output device with required parameters");
+
+        let supported_device = available_device
+            .try_with_sample_rate(cpal::SampleRate(codec.sample_rate.expect("shitface")))
+            .unwrap_or_else(|| available_device.with_max_sample_rate());
+
+        let position = self.position.clone();
+
+        let mut buffer: VecDeque<f32> = VecDeque::new();
+        self.stream = self
+            .device
+            .build_output_stream(
+                &supported_device.config(),
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    while data.len() > buffer.len() {
+                        match format.next_packet() {
+                            Ok(Some(packet)) => {
+                                if packet.track_id() != track_id {
+                                    continue;
+                                }
+
+                                if let Err(ts) = position.compare_exchange(
+                                    packet.ts,
+                                    packet.ts + packet.dur,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::Acquire,
+                                ) {
+                                    let _ = format.seek(
+                                        symphonia::core::formats::SeekMode::Accurate,
+                                        symphonia::core::formats::SeekTo::TimeStamp {
+                                            ts,
+                                            track_id,
+                                        },
+                                    );
+                                    decoder.reset();
+                                }
+
+                                let packet = decoder.decode(&packet).expect("failed to decode");
+
+                                let mut samples =
+                                    vec![0.0; packet.samples_interleaved()].into_boxed_slice();
+                                packet.copy_to_slice_interleaved(&mut samples);
+                                buffer.extend(&samples);
+                            },
+                            Err(symphonia::core::errors::Error::ResetRequired) => {
+                                // Reset decoder
+                                trace!(track_id, "Decoder reset");
+                                decoder.reset();
+                            },
+                            Err(_) | Ok(None) => {
+                                // Side-effect of doing it like this is that if a song finishes, we
+                                // cannot seek
+                                while data.len() > buffer.len() {
+                                    buffer.push_back(0.0);
+                                }
+                            },
+                        }
+                    }
+
+                    for (index, sample) in buffer.drain(..data.len()).enumerate() {
+                        data[index] = sample;
+                    }
+                },
+                move |err| {
+                    tracing::error!(?err);
+                },
+                None,
+            )
+            .expect("failed to create stream");
     }
 }
 
@@ -79,8 +278,12 @@ impl eframe::App for App {
         ctx: &egui::Context,
         _frame: &mut eframe::Frame,
     ) {
+        if !ctx.has_requested_repaint() {
+            ctx.request_repaint();
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            let selected_name = self.audio_device.name().expect("Audio device has no name");
+            let selected_name = self.device.name().expect("Audio device has no name");
             egui::ComboBox::from_label("Devices")
                 .selected_text(&selected_name)
                 .show_ui(ui, |ui| {
@@ -96,10 +299,39 @@ impl eframe::App for App {
                             )
                             .clicked()
                         {
-                            self.audio_device = device;
+                            self.device = device;
                         }
                     }
                 });
+
+            if let Some(ref metadata) = self.metadata {
+                ui.horizontal(|ui| {
+                    let current = self.position.load(std::sync::atomic::Ordering::SeqCst);
+
+                    let width = ui.max_rect().width();
+                    let prev_width = ui.data(|data| {
+                        data.get_temp(egui::Id::new("progress_prev_width"))
+                            .unwrap_or(width)
+                    });
+                    let target_width = width - prev_width;
+
+                    let current_sec = metadata.timebase.calc_time(current).seconds;
+                    let duration_sec = metadata.timebase.calc_time(metadata.duration).seconds;
+                    ui.label(format!("{current_sec}"));
+                    ui.add(
+                        egui::ProgressBar::new(current as f32 / metadata.duration as f32)
+                            .desired_width(target_width),
+                    );
+                    ui.label(format!("{duration_sec}"));
+
+                    ui.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("progress_prev_width"),
+                            ui.min_rect().width() - target_width,
+                        );
+                    });
+                });
+            }
 
             ui.label("Hello world!");
             if ui.button("Open file").clicked() {
@@ -119,95 +351,22 @@ impl eframe::App for App {
                     }
 
                     // Figure out what it has
-                    let ProbeResult {
-                        mut format,
-                        metadata: _,
-                    } = symphonia::default::get_probe()
-                        .format(
+                    let format = symphonia::default::get_probe()
+                        .probe(
                             &hint,
                             mss,
-                            &FormatOptions {
+                            FormatOptions {
                                 enable_gapless: true,
                                 prebuild_seek_index: true,
                                 ..Default::default()
                             },
-                            &MetadataOptions::default(),
+                            MetadataOptions::default(),
                         )
                         .expect("Failed to probe file");
 
-                    let track = format.default_track().expect("no default track");
-                    let track_id = track.id;
-                    let mut decoder: Box<dyn Decoder> = symphonia::default::get_codecs()
-                        .make(&track.codec_params, &DecoderOptions::default())
-                        .expect("e");
+                    // TODO: MPRIS over (z)bus w/ metadata (source agnostic required)
 
-                    // Create an audio device
-                    let supported_device = self
-                        .audio_device
-                        .supported_output_configs()
-                        .expect("No output configs")
-                        .filter(|config| {
-                            config.channels() as usize
-                                == track
-                                    .codec_params
-                                    .channels
-                                    .expect("No channels in file")
-                                    .count()
-                                && config.sample_format() == cpal::SampleFormat::F32
-                        })
-                        .find_map(|config| {
-                            config.try_with_sample_rate(cpal::SampleRate(
-                                track.codec_params.sample_rate.expect("shitface"),
-                            ))
-                        })
-                        .expect("winblows");
-
-                    let mut buffer: VecDeque<f32> = VecDeque::new();
-                    let stream = self
-                        .audio_device
-                        .build_output_stream(
-                            &supported_device.config(),
-                            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                                while data.len() > buffer.len() {
-                                    let mut filled = false;
-                                    while let Ok(packet) = format.next_packet() {
-                                        if packet.track_id() != track_id {
-                                            continue;
-                                        }
-
-                                        let packet =
-                                            decoder.decode(&packet).expect("failed to decode");
-                                        let mut audio: AudioBuffer<f32> = packet.make_equivalent();
-                                        packet.convert(&mut audio);
-
-                                        // Audio buffer should be interlaced
-                                        for sample in 0..audio.capacity() {
-                                            for channel in 0..audio.spec().channels.count() {
-                                                buffer.push_back(audio.chan(channel)[sample]);
-                                            }
-                                        }
-                                        filled = true;
-                                        break;
-                                    }
-
-                                    if !filled {
-                                        for _ in 0..data.len() {
-                                            buffer.push_back(0.0);
-                                        }
-                                    }
-                                }
-
-                                for (index, sample) in buffer.drain(..data.len()).enumerate() {
-                                    data[index] = sample;
-                                }
-                            },
-                            move |err| {
-                                tracing::error!(?err);
-                            },
-                            None,
-                        )
-                        .expect("failed to create stream");
-                    self.current_stream = Some(stream);
+                    self.start_symphonia_stream(format);
                 }
             }
         });
