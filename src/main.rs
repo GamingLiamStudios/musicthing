@@ -77,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window_builder: Some(Box::new(|builder| {
                 builder.with_title("musicthing").with_app_id("floating") // for me, will fix later - GLS
             })),
+            vsync: true,
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
@@ -226,13 +227,18 @@ impl App {
                                     std::sync::atomic::Ordering::SeqCst,
                                     std::sync::atomic::Ordering::Acquire,
                                 ) {
-                                    let _ = format.seek(
+                                    if let Ok(ts) = format.seek(
                                         symphonia::core::formats::SeekMode::Accurate,
                                         symphonia::core::formats::SeekTo::TimeStamp {
                                             ts,
                                             track_id,
                                         },
-                                    );
+                                    ) {
+                                        position.store(
+                                            ts.actual_ts,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                    }
                                     decoder.reset();
                                 }
 
@@ -304,34 +310,51 @@ impl eframe::App for App {
                     }
                 });
 
-            if let Some(ref metadata) = self.metadata {
+            ui.vertical(|ui| {
+                if let Some(ref metadata) = self.metadata {
+                    ui.horizontal(|ui| {
+                        let mut current = self.position.load(std::sync::atomic::Ordering::SeqCst);
+
+                        let width = ui.max_rect().width();
+                        let prev_width = ui.data(|data| {
+                            data.get_temp(egui::Id::new("progress_prev_width"))
+                                .unwrap_or(width)
+                        });
+                        let target_width = width - prev_width;
+
+                        let current_sec = metadata.timebase.calc_time(current).seconds;
+                        let duration_sec = metadata.timebase.calc_time(metadata.duration).seconds;
+                        ui.label(format!("{current_sec}"));
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut current, 0..=metadata.duration)
+                                    .show_value(false),
+                            )
+                            .drag_stopped()
+                        {
+                            self.position
+                                .store(current, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        ui.label(format!("{duration_sec}"));
+
+                        ui.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("progress_prev_width"),
+                                ui.min_rect().width() - target_width,
+                            );
+                        });
+                    });
+                }
+
                 ui.horizontal(|ui| {
-                    let current = self.position.load(std::sync::atomic::Ordering::SeqCst);
-
-                    let width = ui.max_rect().width();
-                    let prev_width = ui.data(|data| {
-                        data.get_temp(egui::Id::new("progress_prev_width"))
-                            .unwrap_or(width)
-                    });
-                    let target_width = width - prev_width;
-
-                    let current_sec = metadata.timebase.calc_time(current).seconds;
-                    let duration_sec = metadata.timebase.calc_time(metadata.duration).seconds;
-                    ui.label(format!("{current_sec}"));
-                    ui.add(
-                        egui::ProgressBar::new(current as f32 / metadata.duration as f32)
-                            .desired_width(target_width),
-                    );
-                    ui.label(format!("{duration_sec}"));
-
-                    ui.data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::new("progress_prev_width"),
-                            ui.min_rect().width() - target_width,
-                        );
-                    });
-                });
-            }
+                    if ui.button("play").clicked() {
+                        self.stream.play();
+                    }
+                    if ui.button("pause").clicked() {
+                        self.stream.pause();
+                    }
+                })
+            });
 
             ui.label("Hello world!");
             if ui.button("Open file").clicked() {
